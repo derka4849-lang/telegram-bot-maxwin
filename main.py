@@ -379,7 +379,7 @@ if __name__ == "__main__":
         print(f"\n\nFatal error: {e}")
         import traceback
         traceback.print_exc()
-        input("\nPress Enter to exit...")
+        # Не используем input() на сервере
 
 
 # Удалён весь Flask код - больше не нужен

@@ -1,0 +1,8 @@
+{
+  "buildpacks": [
+    {
+      "url": "https://github.com/Scalingo/python-buildpack"
+    }
+  ]
+}
+

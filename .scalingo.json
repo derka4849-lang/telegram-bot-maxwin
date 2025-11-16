@@ -1,4 +1,7 @@
 {
+  "buildpacks": [
+    "https://github.com/Scalingo/python-buildpack"
+  ],
   "formation": {
     "worker": {
       "amount": 1,

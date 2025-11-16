@@ -12,6 +12,7 @@ COPY . .
 # Expose port (Scalingo requirement)
 EXPOSE 5000
 
-# Run the bot
-CMD ["python", "main.py"]
+# Use Procfile for process management
+# Scalingo will use Procfile to determine processes
+# CMD is set in Procfile
 

@@ -1,6 +1,3 @@
-# fly.toml app configuration file generated for telegram-bot-maxwin
-# See https://fly.io/docs/reference/configuration/ for information about how to use this file.
-
 app = "telegram-bot-maxwin"
 primary_region = "iad"
 

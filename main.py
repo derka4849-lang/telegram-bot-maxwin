@@ -11,6 +11,14 @@ from telegram.ext import (
     filters,
 )
 
+# Keep-alive для Replit (предотвращает "засыпание" бота)
+try:
+    from keep_alive import keep_alive
+    keep_alive()
+    print("✅ Keep-alive сервер запущен (Replit)")
+except ImportError:
+    pass  # Если keep_alive.py нет, просто пропускаем
+
 BOT_TOKEN = os.getenv("BOT_TOKEN", "8239304307:AAGxvv1cI82eYE-mHIAFtts-QkO8-tQj2-M")
 
 GAMES = {

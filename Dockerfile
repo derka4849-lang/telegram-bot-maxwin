@@ -9,6 +9,9 @@ RUN pip install --no-cache-dir -r requirements.txt
 # Copy application code
 COPY . .
 
+# Expose port (Scalingo requirement)
+EXPOSE 5000
+
 # Run the bot
 CMD ["python", "main.py"]
 

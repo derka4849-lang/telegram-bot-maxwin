@@ -1,7 +1,9 @@
 import os
 import asyncio
-import random
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, InputMediaPhoto
+import re
+import tempfile
+from pathlib import Path
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (
     Application,
     CallbackQueryHandler,
@@ -21,49 +23,187 @@ except ImportError:
 
 BOT_TOKEN = os.getenv("BOT_TOKEN", "8239304307:AAGxvv1cI82eYE-mHIAFtts-QkO8-tQj2-M")
 
-GAMES = {
-    "sweet_bonanza": "Sweet Bonanza",
-    "gates_of_olympus": "Gates of Olympus",
-    "starlight_princess": "Starlight Princess",
-    "sugar_rush": "Sugar Rush",
-    "the_dog_house": "The Dog House",
-    "big_bass_bonanza": "Big Bass Bonanza",
-    "fruit_party": "Fruit Party",
-    "wild_west_gold": "Wild West Gold",
-    "mustang_gold": "Mustang Gold",
-    "great_rhino": "Great Rhino",
-    "wolf_gold": "Wolf Gold",
-    "john_henry": "John Henry",
-    "madame_destiny": "Madame Destiny",
-    "fire_strike": "Fire Strike",
-    "joker_jewels": "Joker Jewels",
-    "hot_fiesta": "Hot Fiesta",
-    "candy_village": "Candy Village",
-    "gems_bonanza": "Gems Bonanza",
-    "wild_bandito": "Wild Bandito",
-    "bigger_bass_bonanza": "Bigger Bass Bonanza",
-}
+# Папка для временных файлов
+TEMP_DIR = Path("temp_downloads")
+TEMP_DIR.mkdir(exist_ok=True)
+
+# Максимальный размер файла для Telegram (50MB для видео)
+MAX_FILE_SIZE = 50 * 1024 * 1024  # 50 MB
+
+
+def is_youtube_url(url: str) -> bool:
+    """Проверяет, является ли ссылка ссылкой на YouTube."""
+    youtube_patterns = [
+        r'(?:https?://)?(?:www\.)?(?:youtube\.com/watch\?v=|youtu\.be/|youtube\.com/embed/|youtube\.com/v/)',
+        r'(?:https?://)?(?:www\.)?youtube\.com/shorts/',
+    ]
+    return any(re.search(pattern, url) for pattern in youtube_patterns)
+
+
+def extract_video_id(url: str) -> str:
+    """Извлекает ID видео из URL."""
+    patterns = [
+        r'(?:youtube\.com/watch\?v=|youtu\.be/|youtube\.com/embed/|youtube\.com/v/)([a-zA-Z0-9_-]{11})',
+        r'youtube\.com/shorts/([a-zA-Z0-9_-]{11})',
+    ]
+    for pattern in patterns:
+        match = re.search(pattern, url)
+        if match:
+            return match.group(1)
+    return ""
+
+
+async def download_video(url: str, quality: str = "best", audio_only: bool = False) -> tuple[str, dict]:
+    """
+    Скачивает видео с YouTube используя yt-dlp.
+    
+    Args:
+        url: Ссылка на YouTube видео
+        quality: Качество видео (best, worst, или формат типа 720p)
+        audio_only: Если True, скачивает только аудио
+    
+    Returns:
+        tuple: (путь к файлу, информация о видео)
+    """
+    import yt_dlp
+    
+    # Настройки для yt-dlp
+    ydl_opts = {
+        'outtmpl': str(TEMP_DIR / '%(title)s.%(ext)s'),
+        'quiet': True,
+        'no_warnings': True,
+    }
+    
+    if audio_only:
+        ydl_opts.update({
+            'format': 'bestaudio/best',
+            'postprocessors': [{
+                'key': 'FFmpegExtractAudio',
+                'preferredcodec': 'mp3',
+                'preferredquality': '192',
+            }],
+        })
+    else:
+        if quality == "best":
+            ydl_opts['format'] = 'best[filesize<50M]/best'
+        elif quality == "worst":
+            ydl_opts['format'] = 'worst'
+        else:
+            # Попытка найти формат с указанным качеством
+            ydl_opts['format'] = f'best[height<={quality}][filesize<50M]/best[filesize<50M]'
+    
+    try:
+        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+            # Получаем информацию о видео
+            info = ydl.extract_info(url, download=False)
+            video_title = info.get('title', 'video')
+            duration = info.get('duration', 0)
+            filesize = info.get('filesize') or info.get('filesize_approx', 0)
+            
+            # Проверяем размер файла
+            if filesize > MAX_FILE_SIZE and not audio_only:
+                # Пробуем скачать в более низком качестве
+                ydl_opts['format'] = 'best[height<=720][filesize<50M]/best[filesize<50M]'
+                with yt_dlp.YoutubeDL(ydl_opts) as ydl2:
+                    info = ydl2.extract_info(url, download=True)
+            else:
+                ydl.download([url])
+            
+            # Находим скачанный файл
+            downloaded_file = None
+            for file in TEMP_DIR.iterdir():
+                if file.is_file():
+                    downloaded_file = file
+                    break
+            
+            if not downloaded_file:
+                raise Exception("Файл не был скачан")
+            
+            video_info = {
+                'title': video_title,
+                'duration': duration,
+                'filesize': downloaded_file.stat().st_size,
+                'filename': downloaded_file.name,
+            }
+            
+            return str(downloaded_file), video_info
+            
+    except Exception as e:
+        raise Exception(f"Ошибка при скачивании: {str(e)}")
+
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Команда /start – показывает меню выбора игры."""
-    context.user_data.clear()
-    context.user_data["active"] = True
+    """Команда /start – приветствие и инструкция."""
+    welcome_text = (
+        "👋 <b>Привет! Я бот для скачивания YouTube видео</b> 📥\n\n"
+        "📌 <b>Как использовать:</b>\n"
+        "1. Отправьте мне ссылку на YouTube видео\n"
+        "2. Выберите формат (видео или аудио)\n"
+        "3. Получите скачанное видео/аудио\n\n"
+        "✨ <b>Поддерживаемые форматы:</b>\n"
+        "• Обычные видео (youtube.com/watch?v=...)\n"
+        "• Короткие видео (youtube.com/shorts/...)\n"
+        "• Ссылки youtu.be\n\n"
+        "🚀 Просто отправьте ссылку на видео!"
+    )
+    
+    await update.message.reply_text(
+        welcome_text,
+        parse_mode="HTML"
+    )
 
+
+async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Команда /help – справка."""
+    help_text = (
+        "📖 <b>Справка по использованию бота</b>\n\n"
+        "🔗 <b>Отправка ссылки:</b>\n"
+        "Просто отправьте ссылку на YouTube видео в чат.\n\n"
+        "📥 <b>Форматы скачивания:</b>\n"
+        "• <b>Видео</b> - скачивает видео с лучшим качеством (до 50MB)\n"
+        "• <b>Аудио</b> - скачивает только звук в формате MP3\n\n"
+        "⚙️ <b>Команды:</b>\n"
+        "/start - Начать работу с ботом\n"
+        "/help - Показать эту справку\n\n"
+        "⚠️ <b>Ограничения:</b>\n"
+        "• Максимальный размер файла: 50MB\n"
+        "• Для больших видео будет предложено более низкое качество\n"
+        "• Некоторые видео могут быть недоступны для скачивания"
+    )
+    
+    await update.message.reply_text(
+        help_text,
+        parse_mode="HTML"
+    )
+
+
+async def url_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Обрабатывает ссылки на YouTube видео."""
+    url = update.message.text.strip()
+    
+    if not is_youtube_url(url):
+        await update.message.reply_text(
+            "❌ Это не похоже на ссылку YouTube.\n\n"
+            "Пожалуйста, отправьте корректную ссылку на YouTube видео.\n"
+            "Например: https://www.youtube.com/watch?v=dQw4w9WgXcQ"
+        )
+        return
+    
+    # Сохраняем URL в контексте пользователя
+    context.user_data["youtube_url"] = url
+    
+    # Показываем меню выбора формата
     keyboard = [
         [
-            InlineKeyboardButton("🎰 Выбрать игру", callback_data="select_game"),
-            InlineKeyboardButton("🎁 Бонус", callback_data="bonus")
-        ],
-        [
-            InlineKeyboardButton("ℹ️ Помощь", callback_data="help"),
-            InlineKeyboardButton("ℹ️ О боте", callback_data="about")
-        ],
+            InlineKeyboardButton("📹 Видео", callback_data="format_video"),
+            InlineKeyboardButton("🎵 Аудио (MP3)", callback_data="format_audio")
+        ]
     ]
-    reply_markup = InlineKeyboardMarkup(keyboard)
-
+    
     await update.message.reply_text(
-        "👋 Привет! Это MaxWIN Radar 🎰✨",
-        reply_markup=reply_markup,
+        "✅ Ссылка распознана!\n\n"
+        "📥 Выберите формат скачивания:",
+        reply_markup=InlineKeyboardMarkup(keyboard)
     )
 
 
@@ -71,266 +211,100 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Обработчик нажатий на inline-кнопки."""
     query = update.callback_query
     await query.answer()
-
-    if not context.user_data.get("active"):
+    
+    url = context.user_data.get("youtube_url")
+    
+    if not url:
         await query.edit_message_text(
-            "Сначала отправьте команду /start, чтобы активировать бота."
+            "❌ Ссылка не найдена. Пожалуйста, отправьте ссылку на YouTube видео."
         )
         return
-
-    if query.data == "select_game" or query.data.startswith("page_"):
-        # Получаем номер страницы из callback_data или используем 0
-        page = 0
-        if query.data.startswith("page_"):
-            try:
-                page = int(query.data.split("page_")[1])
-            except:
-                page = 0
+    
+    if query.data == "format_video":
+        await query.edit_message_text("⏳ Начинаю скачивание видео...")
         
-        games_list = list(GAMES.items())
-        games_per_page = 5
-        total_pages = (len(games_list) + games_per_page - 1) // games_per_page
-        
-        # Получаем игры для текущей страницы
-        start_idx = page * games_per_page
-        end_idx = start_idx + games_per_page
-        page_games = games_list[start_idx:end_idx]
-        
-        # Создаём кнопки для игр на текущей странице
-        keyboard = []
-        for key, name in page_games:
-            keyboard.append([InlineKeyboardButton(name, callback_data=f"game_{key}")])
-        
-        # Кнопки навигации в одной строке, разделённые пополам
-        nav_buttons = []
-        if page > 0 and page < total_pages - 1:
-            # Обе кнопки есть - размещаем их рядом
-            nav_buttons = [
-                InlineKeyboardButton("⬅️ Назад", callback_data=f"page_{page-1}"),
-                InlineKeyboardButton("Вперёд ➡️", callback_data=f"page_{page+1}")
-            ]
-        elif page > 0:
-            # Только кнопка "Назад"
-            nav_buttons = [InlineKeyboardButton("⬅️ Назад", callback_data=f"page_{page-1}")]
-        elif page < total_pages - 1:
-            # Только кнопка "Вперёд"
-            nav_buttons = [InlineKeyboardButton("Вперёд ➡️", callback_data=f"page_{page+1}")]
-        
-        if nav_buttons:
-            keyboard.append(nav_buttons)
-        
-        keyboard.append([InlineKeyboardButton("⬅️ В главное меню", callback_data="back_to_menu")])
-        
-        page_info = f" (Страница {page + 1} из {total_pages})" if total_pages > 1 else ""
-        await query.edit_message_text(
-            f"Выберите слот для анализа:{page_info}",
-            reply_markup=InlineKeyboardMarkup(keyboard),
-        )
-        return
-
-    if query.data.startswith("game_"):
-        game_key = query.data.split("game_", maxsplit=1)[1]
-        game_name = GAMES.get(game_key)
-
-        if not game_name:
-            await query.edit_message_text(
-                "Не удалось найти выбранную игру. Попробуйте снова /start."
+        try:
+            file_path, video_info = await asyncio.to_thread(download_video, url, quality="best", audio_only=False)
+            
+            # Форматируем размер файла
+            file_size_mb = video_info['filesize'] / (1024 * 1024)
+            duration_min = video_info['duration'] // 60
+            duration_sec = video_info['duration'] % 60
+            
+            caption = (
+                f"📹 <b>{video_info['title']}</b>\n\n"
+                f"📊 Размер: {file_size_mb:.2f} MB\n"
+                f"⏱ Длительность: {duration_min}:{duration_sec:02d}"
             )
-            return
-
-        context.user_data["selected_game"] = game_name
-        await query.edit_message_text(
-            f"✅ Игра «{game_name}» выбрана! 🎰\n\n"
-            "📸 Теперь загрузите изображение слота для анализа.",
-            reply_markup=InlineKeyboardMarkup(
-                [
-                    [
-                        InlineKeyboardButton(
-                            "🔄 Сменить игру", callback_data="select_game"
-                        )
-                    ]
-                ]
-            ),
-        )
-        return
-
-    if query.data == "bonus":
-        keyboard = [
-            [InlineKeyboardButton("⬅️ Назад", callback_data="back_to_menu")],
-        ]
-        await query.edit_message_text(
-            "🎁✨ <b>Бонусный промокод</b> 🎊💎\n\n"
-            "💰 <b>Промокод к депозиту</b> 💵\n\n"
-            "🔥 Используй этот промокод для получения бонуса:\n\n"
-            "━━━━━━━━━━━━━━━━━━\n"
-            "   <code>AI17UAPZ</code>\n"
-            "━━━━━━━━━━━━━━━━━━\n\n"
-            "💫 <a href=\"https://1wclaa.life/?p=e6jt\">Нажми здесь, чтобы перейти на сайт и активировать промокод!</a>\n\n"
-            "🎉 Удачи! 🍀",
-            parse_mode="HTML",
-            reply_markup=InlineKeyboardMarkup(keyboard),
-        )
-        return
-
-    if query.data == "help":
-        keyboard = [
-            [InlineKeyboardButton("📸 Пример", callback_data="show_example")],
-            [InlineKeyboardButton("🎰 Выбрать игру", callback_data="select_game")],
-            [InlineKeyboardButton("⬅️ Назад", callback_data="back_to_menu")],
-        ]
-        
-        help_text = (
-            "📌 Как пользоваться ботом:\n\n"
-            "1. Нажми «Выбрать игру»\n"
-            "2. Выбери слот из списка\n"
-            "3. Отправь скриншот слота 📸\n"
-            "4. Получи прогноз по бонусной игре"
-        )
-        
-        await query.edit_message_text(
-            help_text,
-            reply_markup=InlineKeyboardMarkup(keyboard),
-        )
-        return
-
-    if query.data == "show_example":
-        screenshot_path = "help_screenshot.jpg"
-        keyboard = [
-            [InlineKeyboardButton("⬅️ Назад к помощи", callback_data="help")],
-        ]
-        
-        if os.path.exists(screenshot_path):
+            
+            # Отправляем видео
+            with open(file_path, 'rb') as video_file:
+                await query.message.reply_video(
+                    video=video_file,
+                    caption=caption,
+                    parse_mode="HTML"
+                )
+            
+            # Удаляем временный файл
             try:
-                with open(screenshot_path, 'rb') as photo:
-                    await query.message.reply_photo(
-                        photo=photo,
-                        caption="📸 Пример скриншота слота для анализа",
-                        reply_markup=InlineKeyboardMarkup(keyboard),
-                    )
-                    await query.answer("Пример отправлен!")
-            except Exception as e:
-                await query.answer("Ошибка при загрузке примера", show_alert=True)
-        else:
-            await query.answer("Файл с примером не найден", show_alert=True)
-        return
-
-    if query.data == "about":
-        keyboard = [
-            [InlineKeyboardButton("⬅️ Назад", callback_data="back_to_menu")],
-        ]
-        await query.edit_message_text(
-            "🤖 <b>О боте MaxWIN Radar</b> 🎰\n\n"
-            "📱 <b>Что это за бот?</b>\n"
-            "MaxWIN Radar — это умный помощник для анализа слотов! 🎯\n\n"
-            "🔍 <b>Как он работает?</b>\n"
-            "• Вы выбираете слот из списка 🎮\n"
-            "• Загружаете скриншот игрового экрана 📸\n"
-            "• Бот анализирует изображение с помощью AI 🤖\n"
-            "• Получаете прогноз: через сколько спинов выпадет бонус 🎁\n"
-            "• Узнаёте вероятность бонусной игры в процентах 📊\n\n"
-            "✨ <b>Особенности:</b>\n"
-            "• Поддержка 20+ популярных слотов 🎰\n"
-            "• Быстрый анализ за секунды ⚡\n"
-            "• Точные прогнозы на основе данных 🎯\n"
-            "• Простой и удобный интерфейс 💫\n\n"
-            "🚀 Начни использовать прямо сейчас!",
-            parse_mode="HTML",
-            reply_markup=InlineKeyboardMarkup(keyboard),
-        )
-        return
-
-    if query.data == "how_it_works":
-        await query.edit_message_text(
-            "📌 Как это работает:\n"
-            "• Вы выбираете слот и отправляете его скриншот.\n"
-            "• Мы анализируем изображение и показываем, когда ждать бонус.\n"
-            "• В демо-версии результат предварительный и всегда сообщает о бонусе через 20 спинов.\n\n"
-            "Готовы попробовать? Нажмите «Выбрать игру».",
-            reply_markup=InlineKeyboardMarkup(
-                [[InlineKeyboardButton("🎰 Выбрать игру", callback_data="select_game")]]
-            ),
-        )
-        return
-
-    if query.data == "back_to_menu":
-        keyboard = [
-            [
-                InlineKeyboardButton("🎰 Выбрать игру", callback_data="select_game"),
-                InlineKeyboardButton("🎁 Бонус", callback_data="bonus")
-            ],
-            [
-                InlineKeyboardButton("ℹ️ Помощь", callback_data="help"),
-                InlineKeyboardButton("ℹ️ О боте", callback_data="about")
-            ],
-        ]
-        await query.edit_message_text(
-            "👋 Привет! Это MaxWIN Radar 🎰✨",
-            reply_markup=InlineKeyboardMarkup(keyboard),
-        )
-        return
-
-
-async def photo_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Обрабатывает загруженные изображения слотов."""
-    game_name = context.user_data.get("selected_game")
-
-    if not context.user_data.get("active"):
-        await update.message.reply_text(
-            "Чтобы начать, отправьте команду /start."
-        )
-        return
-
-    if not game_name:
-        keyboard = [
-            [InlineKeyboardButton("🎰 Выбрать игру", callback_data="select_game")]
-        ]
-        await update.message.reply_text(
-            "❌ Сначала выберите игру!\n\nНажмите кнопку ниже, чтобы выбрать слот для анализа.",
-            reply_markup=InlineKeyboardMarkup(keyboard)
-        )
-        return
-
-    # Генерируем случайные значения
-    spins = random.randint(20, 35)
-    chance = random.randint(71, 93)
+                os.remove(file_path)
+            except:
+                pass
+            
+            await query.edit_message_text("✅ Видео успешно скачано и отправлено!")
+            
+        except Exception as e:
+            error_msg = str(e)
+            if "filesize" in error_msg.lower() or "50" in error_msg:
+                await query.edit_message_text(
+                    "❌ Видео слишком большое (больше 50MB).\n\n"
+                    "Попробуйте скачать только аудио или выберите видео меньшей длительности."
+                )
+            else:
+                await query.edit_message_text(
+                    f"❌ Ошибка при скачивании видео:\n{error_msg}\n\n"
+                    "Попробуйте еще раз или выберите другой формат."
+                )
     
-    # Отправляем сообщение о начале анализа
-    processing_msg = await update.message.reply_text(
-        "⏳ Получил изображение, запускаю MaxWIN Radar…"
-    )
-    
-    # Имитация обработки (можно убрать, если не нужно)
-    await asyncio.sleep(1)
-    
-    # Формируем результат
-    result_text = (
-        f"✅ <b>Анализ завершён</b>\n\n"
-        f"🎰 <b>Слот:</b> {game_name}\n\n"
-        f"📊 <b>Результат анализа:</b>\n"
-        f"• Ожидайте бонус примерно через <b>{spins} спинов</b>\n"
-        f"• Предполагаемая вероятность бонусной игры: <b>{chance}%</b>\n\n"
-        f"🍀 Удачи!"
-    )
-    
-    keyboard = [
-        [InlineKeyboardButton("🔄 Новый анализ", callback_data="select_game")],
-        [InlineKeyboardButton("⬅️ В главное меню", callback_data="back_to_menu")]
-    ]
-    
-    # Удаляем сообщение о обработке и отправляем результат
-    try:
-        await processing_msg.delete()
-    except:
-        pass
-    
-    await update.message.reply_text(
-        result_text,
-        parse_mode="HTML",
-        reply_markup=InlineKeyboardMarkup(keyboard)
-    )
-
-
-# Flask код удалён - больше не нужен, всё работает через inline-кнопки
+    elif query.data == "format_audio":
+        await query.edit_message_text("⏳ Начинаю скачивание аудио...")
+        
+        try:
+            file_path, video_info = await asyncio.to_thread(download_video, url, audio_only=True)
+            
+            # Форматируем размер файла
+            file_size_mb = video_info['filesize'] / (1024 * 1024)
+            duration_min = video_info['duration'] // 60
+            duration_sec = video_info['duration'] % 60
+            
+            caption = (
+                f"🎵 <b>{video_info['title']}</b>\n\n"
+                f"📊 Размер: {file_size_mb:.2f} MB\n"
+                f"⏱ Длительность: {duration_min}:{duration_sec:02d}"
+            )
+            
+            # Отправляем аудио
+            with open(file_path, 'rb') as audio_file:
+                await query.message.reply_audio(
+                    audio=audio_file,
+                    caption=caption,
+                    parse_mode="HTML",
+                    title=video_info['title']
+                )
+            
+            # Удаляем временный файл
+            try:
+                os.remove(file_path)
+            except:
+                pass
+            
+            await query.edit_message_text("✅ Аудио успешно скачано и отправлено!")
+            
+        except Exception as e:
+            await query.edit_message_text(
+                f"❌ Ошибка при скачивании аудио:\n{str(e)}\n\n"
+                "Попробуйте еще раз."
+            )
 
 
 def main():
@@ -339,34 +313,28 @@ def main():
         try:
             asyncio.set_event_loop_policy(asyncio.WindowsProactorEventLoopPolicy())
         except AttributeError:
-            # Если Proactor недоступен, используем Selector
             try:
                 asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
             except AttributeError:
-                pass  # Используем дефолтную политику
+                pass
     
     try:
-        print("Запуск MaxWIN Radar...")
-        print(f"Токен бота: {BOT_TOKEN[:10]}...")  # Показываем только первые 10 символов
+        print("Запуск YouTube Downloader Bot...")
+        print(f"Токен бота: {BOT_TOKEN[:10]}...")
+        
         application = Application.builder().token(BOT_TOKEN).build()
+        
+        # Регистрируем обработчики
         application.add_handler(CommandHandler("start", start))
+        application.add_handler(CommandHandler("help", help_command))
         application.add_handler(CallbackQueryHandler(button_handler))
-        application.add_handler(MessageHandler(filters.PHOTO, photo_handler))
-
+        application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, url_handler))
+        
         print("✅ Бот запущен! Напишите /start в Telegram.")
         print("Ожидание сообщений...")
         
-        # Создаем event loop явно для Python 3.14
-        try:
-            loop = asyncio.get_running_loop()
-        except RuntimeError:
-            try:
-                loop = asyncio.get_event_loop()
-            except RuntimeError:
-                loop = asyncio.new_event_loop()
-                asyncio.set_event_loop(loop)
-        
         application.run_polling()
+        
     except Exception as exc:
         import traceback
         print(f"❌ Ошибка при запуске: {exc}")
@@ -377,7 +345,7 @@ def main():
 
 if __name__ == "__main__":
     print("=" * 50)
-    print("Starting MaxWIN Radar Bot...")
+    print("Starting YouTube Downloader Bot...")
     print("=" * 50)
     try:
         main()
@@ -387,7 +355,3 @@ if __name__ == "__main__":
         print(f"\n\nFatal error: {e}")
         import traceback
         traceback.print_exc()
-        # Не используем input() на сервере
-
-
-# Удалён весь Flask код - больше не нужен

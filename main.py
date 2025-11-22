@@ -53,7 +53,7 @@ def extract_video_id(url: str) -> str:
     return ""
 
 
-async def download_video(url: str, quality: str = "best", audio_only: bool = False) -> tuple[str, dict]:
+def download_video(url: str, quality: str = "best", audio_only: bool = False) -> tuple[str, dict]:
     """
     Скачивает видео с YouTube используя yt-dlp.
     

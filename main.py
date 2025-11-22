@@ -53,6 +53,97 @@ def extract_video_id(url: str) -> str:
     return ""
 
 
+def get_video_info(url: str) -> dict:
+    """
+    Получает информацию о видео без скачивания.
+    
+    Returns:
+        dict: Информация о видео (title, duration, filesize, formats)
+    """
+    import yt_dlp
+    
+    ydl_opts = {
+        'quiet': True,
+        'no_warnings': True,
+    }
+    
+    try:
+        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+            info = ydl.extract_info(url, download=False)
+            
+            video_info = {
+                'title': info.get('title', 'Без названия'),
+                'duration': info.get('duration', 0),
+                'thumbnail': info.get('thumbnail', ''),
+                'uploader': info.get('uploader', 'Неизвестно'),
+                'view_count': info.get('view_count', 0),
+            }
+            
+            # Получаем информацию о размерах для разных качеств
+            formats = info.get('formats', [])
+            quality_info = {}
+            
+            for fmt in formats:
+                height = fmt.get('height')
+                filesize = fmt.get('filesize') or fmt.get('filesize_approx', 0)
+                if height and filesize:
+                    if height not in quality_info or filesize < quality_info[height].get('filesize', float('inf')):
+                        quality_info[height] = {
+                            'filesize': filesize,
+                            'format_id': fmt.get('format_id', ''),
+                        }
+            
+            video_info['available_qualities'] = sorted(quality_info.keys(), reverse=True)
+            video_info['quality_info'] = quality_info
+            
+            # Оценка размера для best качества
+            best_size = info.get('filesize') or info.get('filesize_approx', 0)
+            if not best_size and formats:
+                # Берем максимальный размер из доступных форматов
+                best_size = max([f.get('filesize') or f.get('filesize_approx', 0) for f in formats], default=0)
+            
+            video_info['estimated_size'] = best_size
+            
+            return video_info
+            
+    except Exception as e:
+        raise Exception(f"Ошибка при получении информации: {str(e)}")
+
+
+def estimate_download_time(filesize_bytes: int, speed_mbps: float = 10.0) -> int:
+    """
+    Оценивает время скачивания в секундах.
+    
+    Args:
+        filesize_bytes: Размер файла в байтах
+        speed_mbps: Скорость скачивания в Мбит/с (по умолчанию 10 Мбит/с)
+    
+    Returns:
+        int: Примерное время в секундах
+    """
+    # Конвертируем скорость в байты/сек
+    speed_bytes_per_sec = (speed_mbps * 1024 * 1024) / 8  # Мбит/с -> байт/с
+    
+    # Добавляем 20% накладных расходов
+    estimated_seconds = int((filesize_bytes / speed_bytes_per_sec) * 1.2)
+    
+    return max(estimated_seconds, 5)  # Минимум 5 секунд
+
+
+def format_time(seconds: int) -> str:
+    """Форматирует время в читаемый вид."""
+    if seconds < 60:
+        return f"{seconds} сек"
+    elif seconds < 3600:
+        minutes = seconds // 60
+        secs = seconds % 60
+        return f"{minutes} мин {secs} сек"
+    else:
+        hours = seconds // 3600
+        minutes = (seconds % 3600) // 60
+        return f"{hours} ч {minutes} мин"
+
+
 def download_video(url: str, quality: str = "best", audio_only: bool = False) -> tuple[str, dict]:
     """
     Скачивает видео с YouTube используя yt-dlp.
@@ -192,19 +283,71 @@ async def url_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # Сохраняем URL в контексте пользователя
     context.user_data["youtube_url"] = url
     
-    # Показываем меню выбора формата
-    keyboard = [
-        [
-            InlineKeyboardButton("📹 Видео", callback_data="format_video"),
-            InlineKeyboardButton("🎵 Аудио (MP3)", callback_data="format_audio")
-        ]
-    ]
-    
-    await update.message.reply_text(
-        "✅ Ссылка распознана!\n\n"
-        "📥 Выберите формат скачивания:",
-        reply_markup=InlineKeyboardMarkup(keyboard)
-    )
+    # Получаем информацию о видео
+    try:
+        await update.message.reply_text("⏳ Получаю информацию о видео...")
+        video_info = await asyncio.to_thread(get_video_info, url)
+        
+        # Форматируем информацию
+        duration_min = video_info['duration'] // 60
+        duration_sec = video_info['duration'] % 60
+        estimated_size_mb = video_info['estimated_size'] / (1024 * 1024)
+        download_time = estimate_download_time(video_info['estimated_size'])
+        
+        # Создаем клавиатуру с выбором качества
+        keyboard = []
+        
+        # Кнопки качества видео
+        quality_buttons = []
+        available = video_info.get('available_qualities', [])
+        
+        # Добавляем кнопки качества
+        if 1080 in available:
+            quality_buttons.append(InlineKeyboardButton("1080p", callback_data="quality_1080"))
+        if 720 in available:
+            quality_buttons.append(InlineKeyboardButton("720p", callback_data="quality_720"))
+        if 480 in available:
+            quality_buttons.append(InlineKeyboardButton("480p", callback_data="quality_480"))
+        if 360 in available:
+            quality_buttons.append(InlineKeyboardButton("360p", callback_data="quality_360"))
+        
+        # Добавляем кнопки best/worst
+        quality_buttons.append(InlineKeyboardButton("⭐ Лучшее", callback_data="quality_best"))
+        quality_buttons.append(InlineKeyboardButton("📉 Худшее", callback_data="quality_worst"))
+        
+        # Размещаем кнопки по 2 в ряд
+        for i in range(0, len(quality_buttons), 2):
+            if i + 1 < len(quality_buttons):
+                keyboard.append([quality_buttons[i], quality_buttons[i + 1]])
+            else:
+                keyboard.append([quality_buttons[i]])
+        
+        # Кнопка аудио
+        keyboard.append([InlineKeyboardButton("🎵 Аудио (MP3)", callback_data="format_audio")])
+        
+        info_text = (
+            f"✅ <b>Видео найдено!</b>\n\n"
+            f"📹 <b>{video_info['title']}</b>\n"
+            f"👤 Автор: {video_info['uploader']}\n"
+            f"⏱ Длительность: {duration_min}:{duration_sec:02d}\n"
+            f"📊 Примерный размер: {estimated_size_mb:.1f} MB\n"
+            f"⏳ Примерное время скачивания: ~{format_time(download_time)}\n\n"
+            f"📥 <b>Выберите качество:</b>"
+        )
+        
+        context.user_data["video_info"] = video_info
+        
+        await update.message.reply_text(
+            info_text,
+            parse_mode="HTML",
+            reply_markup=InlineKeyboardMarkup(keyboard)
+        )
+        
+    except Exception as e:
+        await update.message.reply_text(
+            f"❌ Ошибка при получении информации о видео:\n{str(e)}\n\n"
+            "Попробуйте отправить ссылку еще раз."
+        )
 
 
 async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -220,19 +363,99 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return
     
-    if query.data == "format_video":
+    # Обработка выбора качества
+    if query.data.startswith("quality_"):
+        quality = query.data.replace("quality_", "")
+        
+        # Получаем информацию о видео из контекста
+        video_info = context.user_data.get("video_info", {})
+        quality_info = video_info.get('quality_info', {})
+        
+        # Определяем размер для выбранного качества
+        if quality == "best":
+            estimated_size = video_info.get('estimated_size', 0)
+        elif quality == "worst":
+            # Для худшего качества берем минимальный размер
+            available = video_info.get('available_qualities', [])
+            if available:
+                estimated_size = quality_info.get(available[-1], {}).get('filesize', 0)
+            else:
+                estimated_size = video_info.get('estimated_size', 0) * 0.3
+        else:
+            # Для конкретного качества (1080, 720, и т.д.)
+            quality_height = int(quality) if quality.isdigit() else 720
+            estimated_size = quality_info.get(quality_height, {}).get('filesize', 0)
+            if not estimated_size:
+                # Если точного размера нет, оцениваем примерно
+                estimated_size = video_info.get('estimated_size', 0) * (quality_height / 1080) if quality_height <= 1080 else video_info.get('estimated_size', 0)
+        
+        download_time = estimate_download_time(int(estimated_size)) if estimated_size > 0 else 30
+        
+        quality_display = quality.upper() if quality in ["best", "worst"] else f"{quality}p"
+        await query.edit_message_text(
+            f"⏳ Начинаю скачивание видео в качестве {quality_display}...\n"
+            f"⏱ Примерное время: ~{format_time(download_time)}"
+        )
+        
+        try:
+            file_path, download_info = await asyncio.to_thread(download_video, url, quality=quality, audio_only=False)
+            
+            # Форматируем размер файла
+            file_size_mb = download_info['filesize'] / (1024 * 1024)
+            duration_min = download_info['duration'] // 60
+            duration_sec = download_info['duration'] % 60
+            
+            quality_display = quality.upper() if quality in ["best", "worst"] else f"{quality}p"
+            caption = (
+                f"📹 <b>{download_info['title']}</b>\n\n"
+                f"📊 Размер: {file_size_mb:.2f} MB\n"
+                f"⏱ Длительность: {duration_min}:{duration_sec:02d}\n"
+                f"🎬 Качество: {quality_display}"
+            )
+            
+            # Отправляем видео
+            with open(file_path, 'rb') as video_file:
+                await query.message.reply_video(
+                    video=video_file,
+                    caption=caption,
+                    parse_mode="HTML"
+                )
+            
+            # Удаляем временный файл
+            try:
+                os.remove(file_path)
+            except:
+                pass
+            
+            await query.edit_message_text("✅ Видео успешно скачано и отправлено!")
+            
+        except Exception as e:
+            error_msg = str(e)
+            if "filesize" in error_msg.lower() or "50" in error_msg:
+                await query.edit_message_text(
+                    f"❌ Видео слишком большое (больше 50MB) для качества {quality}.\n\n"
+                    "Попробуйте выбрать более низкое качество или скачайте только аудио."
+                )
+            else:
+                await query.edit_message_text(
+                    f"❌ Ошибка при скачивании видео:\n{error_msg}\n\n"
+                    "Попробуйте еще раз или выберите другое качество."
+                )
+    
+    elif query.data == "format_video":
+        # Старый обработчик для обратной совместимости
         await query.edit_message_text("⏳ Начинаю скачивание видео...")
         
         try:
-            file_path, video_info = await asyncio.to_thread(download_video, url, quality="best", audio_only=False)
+            file_path, download_info = await asyncio.to_thread(download_video, url, quality="best", audio_only=False)
             
             # Форматируем размер файла
-            file_size_mb = video_info['filesize'] / (1024 * 1024)
-            duration_min = video_info['duration'] // 60
-            duration_sec = video_info['duration'] % 60
+            file_size_mb = download_info['filesize'] / (1024 * 1024)
+            duration_min = download_info['duration'] // 60
+            duration_sec = download_info['duration'] % 60
             
             caption = (
-                f"📹 <b>{video_info['title']}</b>\n\n"
+                f"📹 <b>{download_info['title']}</b>\n\n"
                 f"📊 Размер: {file_size_mb:.2f} MB\n"
                 f"⏱ Длительность: {duration_min}:{duration_sec:02d}"
             )
@@ -267,7 +490,17 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 )
     
     elif query.data == "format_audio":
-        await query.edit_message_text("⏳ Начинаю скачивание аудио...")
+        # Получаем информацию о видео для оценки времени
+        video_info = context.user_data.get("video_info", {})
+        estimated_size = video_info.get('estimated_size', 0)
+        # Для аудио размер будет меньше, примерно 10% от видео
+        audio_size = estimated_size * 0.1 if estimated_size > 0 else 5 * 1024 * 1024
+        download_time = estimate_download_time(int(audio_size))
+        
+        await query.edit_message_text(
+            f"⏳ Начинаю скачивание аудио...\n"
+            f"⏱ Примерное время: ~{format_time(download_time)}"
+        )
         
         try:
             file_path, video_info = await asyncio.to_thread(download_video, url, audio_only=True)
